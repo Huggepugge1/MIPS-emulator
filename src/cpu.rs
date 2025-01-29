@@ -269,7 +269,7 @@ impl Registers {
 pub struct CPU {
     pub registers: Registers,
     pub halted: bool,
-    pub status: Option<String>,
+    pub exception: Exception,
     jump: bool,
 }
 
@@ -311,9 +311,24 @@ impl std::fmt::Display for Instruction {
     }
 }
 
-#[derive(Debug)]
-enum Exception {
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Exception {
+    #[default]
+    None,
+    Breakpoint,
     IntegerOverflow,
+    Trap,
+}
+
+impl std::fmt::Display for Exception {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Exception::None => write!(f, "No exception"),
+            Exception::Breakpoint => write!(f, "Breakpoint"),
+            Exception::IntegerOverflow => write!(f, "Integer overflow"),
+            Exception::Trap => write!(f, "Trap"),
+        }
+    }
 }
 
 impl CPU {
@@ -329,11 +344,15 @@ impl CPU {
         let address = (instruction & 0x3ffffff) as u32;
 
         let kind = match opcode {
-            0b000000 => InstructionKind::RType,
+            0b000000 => InstructionKind::RType, // Special
             0b000010 => InstructionKind::JType, // j
+            0b000100 => InstructionKind::IType, // beq
             0b000101 => InstructionKind::IType, // bne
+            0b001000 => InstructionKind::IType, // addi
             0b001001 => InstructionKind::IType, // addiu
+            0b001100 => InstructionKind::IType, // andi
             0b001111 => InstructionKind::IType, // lui
+            0b010100 => InstructionKind::IType, // beql
             0b100011 => InstructionKind::IType, // lw
             0b101011 => InstructionKind::IType, // sw
             _ => panic!("Unknown opcode: {:06b}", opcode),
@@ -352,12 +371,8 @@ impl CPU {
     }
 
     fn trigger_exception(&mut self, exception: Exception) {
-        match exception {
-            Exception::IntegerOverflow => {
-                self.status = Some("Integer overflow".to_string());
-                self.halted = true;
-            }
-        }
+        self.exception = exception.clone();
+        self.halted = true;
     }
 
     pub fn run(&mut self, memory: &mut Memory) {
@@ -369,11 +384,15 @@ impl CPU {
     pub fn step(&mut self, memory: &mut Memory) {
         let instruction = self.fetch_instruction(memory);
         match instruction.opcode {
-            0b000000 => self.run_r_type(instruction),
+            0b000000 => self.special(&instruction),
             0b000010 => self.j(&instruction),
+            0b000100 => self.beq(&instruction),
             0b000101 => self.bne(&instruction),
+            0b001000 => self.addi(&instruction),
             0b001001 => self.addiu(&instruction),
+            0b001100 => self.andi(&instruction),
             0b001111 => self.lui(&instruction),
+            0b010100 => self.beql(&instruction),
             0b100011 => self.lw(&instruction, memory),
             0b101011 => self.sw(&instruction, memory),
             _ => panic!("Unknown instruction: {}", instruction),
@@ -388,14 +407,178 @@ impl CPU {
      * r-type
      * opcode: 0b000000
      */
-    fn run_r_type(&mut self, instruction: Instruction) {
+    fn special(&mut self, instruction: &Instruction) {
         match instruction.funct {
+            0b000000 => self.sll(instruction),
+            0b000010 => self.srl(instruction),
+            0b000011 => self.sra(instruction),
+            0b000100 => self.sllv(instruction),
+            0b000110 => self.srlv(instruction),
+            0b000111 => self.srav(instruction),
+            0b001000 => self.jr(instruction),
+            0b001001 => self.jalr(instruction),
+            0b001010 => self.movz(instruction),
+            0b001011 => self.movn(instruction),
             0b001100 => self.syscall(),
-            0b010010 => self.mflo(&instruction),
-            0b011001 => self.multu(&instruction),
-            0b100000 => self.add(&instruction),
-            0b100010 => self.sub(&instruction),
-            _ => panic!("Unknown R-Type instruction: {}", instruction),
+            0b001101 => self.breakpoint(),
+            0b010000 => self.mfhi(instruction),
+            0b010001 => self.mthi(instruction),
+            0b010010 => self.mflo(instruction),
+            0b010011 => self.mtlo(instruction),
+            0b011000 => self.mult(instruction),
+            0b011001 => self.multu(instruction),
+            0b011010 => self.div(instruction),
+            0b011011 => self.divu(instruction),
+            0b100000 => self.add(instruction),
+            0b100001 => self.addu(instruction),
+            0b100010 => self.sub(instruction),
+            0b100011 => self.subu(instruction),
+            0b100100 => self.and(instruction),
+            0b100101 => self.or(instruction),
+            0b100110 => self.xor(instruction),
+            0b100111 => self.nor(instruction),
+            0b101010 => self.slt(instruction),
+            0b101011 => self.sltu(instruction),
+            0b110000 => self.tge(instruction),
+            0b110001 => self.tgeu(instruction),
+            0b110010 => self.tlt(instruction),
+            0b110011 => self.tltu(instruction),
+            0b110100 => self.teq(instruction),
+            0b110110 => self.tne(instruction),
+            _ => panic!("Unknown SPECIAL instruction: {}", instruction),
+        }
+    }
+
+    /**
+     * Shift left logical
+     * opcode: 0b000000
+     * funct: 0b000000
+     */
+    fn sll(&mut self, instruction: &Instruction) {
+        let rt = self.registers.read_register(instruction.rt);
+        let shamt = instruction.shamt;
+        self.registers.write_register(instruction.rd, rt << shamt);
+    }
+
+    /**
+     * Shift right logical
+     * opcode: 0b000000
+     * funct: 0b000010
+     */
+    fn srl(&mut self, instruction: &Instruction) {
+        let rt = self.registers.read_register(instruction.rt);
+        let shamt = instruction.shamt;
+        let result = if instruction.rs == 0 {
+            // Sign makes the shift logical
+            rt >> shamt
+        } else {
+            rt.rotate_right(shamt as u32)
+        };
+        self.registers.write_register(instruction.rd, result);
+    }
+
+    /**
+     * Shift right arithmetic
+     * opcode: 0b000000
+     * funct: 0b000011
+     */
+    fn sra(&mut self, instruction: &Instruction) {
+        let rt = self.registers.read_register(instruction.rt) as i32;
+        let shamt = instruction.shamt;
+        // Sign makes the shift arithmetic
+        self.registers
+            .write_register(instruction.rd, (rt >> shamt) as u32);
+    }
+
+    /**
+     * Shift left logical variable
+     * opcode: 0b000000
+     * funct: 0b000110
+     */
+    fn sllv(&mut self, instruction: &Instruction) {
+        let rt = self.registers.read_register(instruction.rt);
+        let rs = self.registers.read_register(instruction.rs);
+        let shamt = rs & 0x1f;
+        self.registers.write_register(instruction.rd, rt << shamt);
+    }
+
+    /**
+     * Shift right logical variable
+     * opcode: 0b000000
+     * funct: 0b000110
+     */
+    fn srlv(&mut self, instruction: &Instruction) {
+        let rt = self.registers.read_register(instruction.rt);
+        let rs = self.registers.read_register(instruction.rs);
+        let shamt = rs & 0x1f;
+        let result = if instruction.shamt == 1 {
+            rt.rotate_right(shamt)
+        } else {
+            rt >> shamt
+        };
+        self.registers.write_register(instruction.rd, result);
+    }
+
+    /**
+     * Shift right arithmetic variable
+     * opcode: 0b000000
+     * funct: 0b000111
+     */
+    fn srav(&mut self, instruction: &Instruction) {
+        let rt = self.registers.read_register(instruction.rt) as i32;
+        let rs = self.registers.read_register(instruction.rs);
+        let shamt = rs & 0x1f;
+        self.registers
+            .write_register(instruction.rd, (rt >> shamt) as u32);
+    }
+
+    /**
+     * Jump register
+     * opcode: 0b000000
+     * funct: 0b001000
+     */
+    fn jr(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        self.registers.pc = rs;
+        self.jump = true;
+    }
+
+    /**
+     * Jump and link register
+     * opcode: 0b000000
+     * funct: 0b001001
+     */
+    fn jalr(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        self.registers
+            .write_register(instruction.rd, self.registers.pc + 4);
+        self.registers.pc = rs;
+        self.jump = true;
+    }
+
+    /**
+     * Move conditional on zero
+     * opcode: 0b000000
+     * funct: 0b001010
+     */
+    fn movz(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rt == 0 {
+            self.registers.write_register(instruction.rd, rs);
+        }
+    }
+
+    /**
+     * Move conditional on not zero
+     * opcode: 0b000000
+     * funct: 0b001011
+     */
+    fn movn(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rt != 0 {
+            self.registers.write_register(instruction.rd, rs);
         }
     }
 
@@ -412,6 +595,35 @@ impl CPU {
     }
 
     /**
+     * Breakpoint
+     * opcode: 0b000000
+     * funct: 0b001101
+     */
+    fn breakpoint(&mut self) {
+        self.halted = true;
+        self.trigger_exception(Exception::Breakpoint);
+    }
+
+    /**
+     * Move from HI
+     * opcode: 0b000000
+     * funct: 0b010000
+     */
+    fn mfhi(&mut self, instruction: &Instruction) {
+        self.registers
+            .write_register(instruction.rd, self.registers.hi);
+    }
+
+    /**
+     * Move to HI
+     * opcode: 0b000000
+     * funct: 0b010001
+     */
+    fn mthi(&mut self, instruction: &Instruction) {
+        self.registers.hi = self.registers.read_register(instruction.rs);
+    }
+
+    /**
      * Move from LO
      * opcode: 0b000000
      * funct: 0b010010
@@ -422,16 +634,72 @@ impl CPU {
     }
 
     /**
+     * Move to LO
+     * opcode: 0b000000
+     * funct: 0b010011
+     */
+    fn mtlo(&mut self, instruction: &Instruction) {
+        self.registers.lo = self.registers.read_register(instruction.rs);
+    }
+
+    /**
+     * Multiply
+     * opcode: 0b000000
+     * funct: 0b011000
+     */
+    fn mult(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs) as i64;
+        let rt = self.registers.read_register(instruction.rt) as i64;
+        let result = rs * rt;
+        self.registers.hi = (result >> 32) as u32;
+        self.registers.lo = result as u32;
+    }
+
+    /**
      * Multiply unsigned
      * opcode: 0b000000
      * funct: 0b011001
      */
     fn multu(&mut self, instruction: &Instruction) {
-        let rs = self.registers.read_register(instruction.rs);
-        let rt = self.registers.read_register(instruction.rt);
-        let result = rs as u64 * rt as u64;
+        let rs = self.registers.read_register(instruction.rs) as u64;
+        let rt = self.registers.read_register(instruction.rt) as u64;
+        let result = rs * rt;
         self.registers.hi = (result >> 32) as u32;
         self.registers.lo = result as u32;
+    }
+
+    /**
+     * Divide
+     * opcode: 0b000000
+     * funct: 0b011010
+     */
+    fn div(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs) as i32;
+        let rt = self.registers.read_register(instruction.rt) as i32;
+        if rt == 0 {
+            self.registers.hi = 0;
+            self.registers.lo = 0;
+        } else {
+            self.registers.hi = (rs % rt) as u32;
+            self.registers.lo = (rs / rt) as u32;
+        }
+    }
+
+    /**
+     * Divide unsigned
+     * opcode: 0b000000
+     * funct: 0b011011
+     */
+    fn divu(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rt == 0 {
+            self.registers.hi = 0;
+            self.registers.lo = 0;
+        } else {
+            self.registers.hi = (rs % rt) as u32;
+            self.registers.lo = (rs / rt) as u32;
+        }
     }
 
     /**
@@ -440,28 +708,201 @@ impl CPU {
      * funct: 0b100000
      */
     fn add(&mut self, instruction: &Instruction) {
-        let rs = self.registers.read_register(instruction.rs);
-        let rt = self.registers.read_register(instruction.rt);
+        let rs = self.registers.read_register(instruction.rs) as i32;
+        let rt = self.registers.read_register(instruction.rt) as i32;
         if rs.checked_add(rt).is_none() {
             self.trigger_exception(Exception::IntegerOverflow);
         }
+        self.registers
+            .write_register(instruction.rd, (rs + rt) as u32);
+    }
+
+    /**
+     * Add unsigned
+     * opcode: 0b000000
+     * funct: 0b100001
+     */
+    fn addu(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
         self.registers
             .write_register(instruction.rd, rs.wrapping_add(rt));
     }
 
     /**
-     * Add
+     * Subtract
      * opcode: 0b000000
      * funct: 0b100010
      */
     fn sub(&mut self, instruction: &Instruction) {
-        let rs = self.registers.read_register(instruction.rs);
-        let rt = self.registers.read_register(instruction.rt);
+        let rs = self.registers.read_register(instruction.rs) as i32;
+        let rt = self.registers.read_register(instruction.rt) as i32;
         if rs.checked_sub(rt).is_none() {
             self.trigger_exception(Exception::IntegerOverflow);
         }
         self.registers
+            .write_register(instruction.rd, (rs - rt) as u32);
+    }
+
+    /**
+     * Subtract unsigned
+     * opcode: 0b000000
+     * funct: 0b100011
+     */
+    fn subu(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        self.registers
             .write_register(instruction.rd, rs.wrapping_sub(rt));
+    }
+
+    /**
+     * And
+     * opcode: 0b000000
+     * funct: 0b100100
+     */
+    fn and(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        self.registers.write_register(instruction.rd, rs & rt);
+    }
+
+    /**
+     * Or
+     * opcode: 0b000000
+     * funct: 0b100101
+     */
+    fn or(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        self.registers.write_register(instruction.rd, rs | rt);
+    }
+
+    /**
+     * Xor
+     * opcode: 0b000000
+     * funct: 0b100110
+     */
+    fn xor(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        self.registers.write_register(instruction.rd, rs ^ rt);
+    }
+
+    /**
+     * Nor
+     * opcode: 0b000000
+     * funct: 0b100111
+     */
+    fn nor(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        self.registers.write_register(instruction.rd, !(rs | rt));
+    }
+
+    /**
+     * Set on less than
+     * opcode: 0b000000
+     * funct: 0b101010
+     */
+    fn slt(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs) as i32;
+        let rt = self.registers.read_register(instruction.rt) as i32;
+        self.registers
+            .write_register(instruction.rd, (rs < rt) as u32);
+    }
+
+    /**
+     * Set on less than unsigned
+     * opcode: 0b000000
+     * funct: 0b101011
+     */
+    fn sltu(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        self.registers
+            .write_register(instruction.rd, (rs < rt) as u32);
+    }
+
+    /**
+     * Trap if greater or equal
+     * opcode: 0b000000
+     * funct: 0b110000
+     */
+    fn tge(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs) as i32;
+        let rt = self.registers.read_register(instruction.rt) as i32;
+        if rs >= rt {
+            self.trigger_exception(Exception::Trap);
+        }
+    }
+
+    /**
+     * Trap if greater or equal unsigned
+     * opcode: 0b000000
+     * funct: 0b110001
+     */
+    fn tgeu(&mut self, instruction: &Instruction) {
+        println!("tgeu");
+        println!("{}", instruction);
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        println!("rs: {}, rt: {}", rs, rt);
+        if rs >= rt {
+            self.trigger_exception(Exception::Trap);
+        }
+    }
+
+    /**
+     * Trap if less than
+     * opcode: 0b000000
+     * funct: 0b110010
+     */
+    fn tlt(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs) as i32;
+        let rt = self.registers.read_register(instruction.rt) as i32;
+        if rs < rt {
+            self.trigger_exception(Exception::Trap);
+        }
+    }
+
+    /**
+     * Trap if less than unsigned
+     * opcode: 0b000000
+     * funct: 0b110011
+     */
+    fn tltu(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rs < rt {
+            self.trigger_exception(Exception::Trap);
+        }
+    }
+
+    /**
+     * Trap if equal
+     * opcode: 0b000000
+     * funct: 0b110100
+     */
+    fn teq(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rs == rt {
+            self.trigger_exception(Exception::Trap);
+        }
+    }
+
+    /**
+     * Trap if not equal
+     * opcode: 0b000000
+     * funct: 0b110110
+     */
+    fn tne(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rs != rt {
+            self.trigger_exception(Exception::Trap);
+        }
     }
 
     /**
@@ -473,6 +914,19 @@ impl CPU {
         let target = instruction.address << 2;
         // Keep the upper 4 bits of the PC
         self.registers.pc = (self.registers.pc & 0xf0000000) | target;
+    }
+
+    /**
+     * Branch equal
+     * opcode: 0b000100
+     */
+    fn beq(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rs == rt {
+            let target = (instruction.imm as i16 as i32) * 4;
+            self.registers.pc = (self.registers.pc as i32 + target) as u32;
+        }
     }
 
     /**
@@ -489,6 +943,20 @@ impl CPU {
     }
 
     /**
+     * Add immediate
+     * opcode: 0b001000
+     */
+    fn addi(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs) as i32;
+        let imm = instruction.imm as i16 as i32;
+        if rs.checked_add(imm).is_none() {
+            self.trigger_exception(Exception::IntegerOverflow);
+        }
+        self.registers
+            .write_register(instruction.rt, rs.wrapping_add(imm) as u32);
+    }
+
+    /**
      * Add immediate unsigned
      * opcode: 0b001001
      */
@@ -500,12 +968,35 @@ impl CPU {
     }
 
     /**
+     * And immediate
+     * opcode: 0b001100
+     */
+    fn andi(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let imm = instruction.imm as u32;
+        self.registers.write_register(instruction.rt, rs & imm);
+    }
+
+    /**
      * Load upper immediate
      * opcode: 0b001111
      */
     fn lui(&mut self, instruction: &Instruction) {
         self.registers
             .write_register_high(instruction.rt, instruction.imm);
+    }
+
+    /**
+     * Branch equal likely
+     * opcode: 0b010100
+     */
+    fn beql(&mut self, instruction: &Instruction) {
+        let rs = self.registers.read_register(instruction.rs);
+        let rt = self.registers.read_register(instruction.rt);
+        if rs == rt {
+            let target = (instruction.imm as i16 as i32) * 4;
+            self.registers.pc = (self.registers.pc as i32 + target) as u32;
+        }
     }
 
     /**
@@ -554,43 +1045,282 @@ mod tests {
         assert_eq!(instruction.address, 0x2aaaaaa);
     }
 
+    // opcode: 0b000000
+    // funct: 0b000000
     #[test]
-    fn test_run_add() {
+    fn test_run_sll() {
         let mut cpu = CPU::default();
         let mut memory = Memory::default();
         memory.text_address = 0x00400000;
-        cpu.registers.t1 = 1;
+        memory.write_word(0x00400000, 0x000A4880); // sll $t1, $t2, 2
+        cpu.registers.t2 = 0b0000_0000_0000_0000_0000_0000_0000_1010;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b0000_0000_0000_0000_0000_0000_0010_1000);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b000010
+    #[test]
+    fn test_run_srl() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x000A4882); // srl $t1, $t2, 2
+        cpu.registers.t2 = 0b0000_0000_0000_0000_0000_0000_0000_1010;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b0000_0000_0000_0000_0000_0000_0000_0010);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b000011
+    #[test]
+    fn test_run_sra() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x000A4883); // sra $t1, $t2, 2
+        cpu.registers.t2 = 0b1000_0000_0000_0000_0000_0000_0000_1010;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b1110_0000_0000_0000_0000_0000_0000_0010);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b000010
+    #[test]
+    fn test_run_rotr() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x002A4882); // rotr $t1, $t2, 2
+        cpu.registers.t2 = 0b0000_0000_0000_0000_0000_0000_0000_1010;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b1000_0000_0000_0000_0000_0000_0000_0010);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b000100
+    #[test]
+    fn test_run_sllv() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x016A4804); // sllv $t1, $t2, $t3
+        cpu.registers.t2 = 0b0000_0000_0000_0000_0000_0000_0000_1010;
+        cpu.registers.t3 = 2;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b0000_0000_0000_0000_0000_0000_0010_1000);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b000110
+    #[test]
+    fn test_run_srlv() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x016A4806); // srlv $t1, $t2, $t3
+        cpu.registers.t2 = 0b0000_0000_0000_0000_0000_0000_0000_1010;
+        cpu.registers.t3 = 2;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b0000_0000_0000_0000_0000_0000_0000_0010);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b000111
+    #[test]
+    fn test_run_srav() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x016A4807); // srav $t1, $t2, $t3
+        cpu.registers.t2 = 0b1000_0000_0000_0000_0000_0000_0000_1010;
+        cpu.registers.t3 = 2;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b1110_0000_0000_0000_0000_0000_0000_0010);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b000110
+    #[test]
+    fn test_run_rotrv() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x014B4846); // rotrv $t1, $t2, $t3
         cpu.registers.t2 = 2;
-        memory.write_word(0x00400000, 0x012a4820); // add $t1, $t1, $t2
+        cpu.registers.t3 = 0b0000_0000_0000_0000_0000_0000_0000_1010;
         cpu.step(&mut memory);
-        assert_eq!(cpu.registers.t1, 3);
-        assert_eq!(cpu.registers.t2, 2);
+        assert_eq!(cpu.registers.t1, 0b1000_0000_0000_0000_0000_0000_0000_0010);
     }
 
+    // opcode: 0b000000
+    // funct: 0b001000
     #[test]
-    fn test_run_addiu() {
+    fn test_run_jr() {
         let mut cpu = CPU::default();
         let mut memory = Memory::default();
         memory.text_address = 0x00400000;
-        cpu.registers.t1 = 1;
-        memory.write_word(0x00400000, 0x25290003); // addiu $t1, $t1, 0x4821
+        cpu.registers.t1 = 0xDEADBEEF;
+        memory.write_word(0x00400000, 0x01200008); // jr $t1
         cpu.step(&mut memory);
-        assert_eq!(cpu.registers.t1, 4);
+        assert_eq!(cpu.registers.pc, 0xDEADBEEF);
     }
 
+    // opcode: 0b000000
+    // funct: 0b001001
     #[test]
-    fn test_run_sub() {
+    fn test_run_jalr() {
         let mut cpu = CPU::default();
         let mut memory = Memory::default();
         memory.text_address = 0x00400000;
-        cpu.registers.t1 = 1;
-        cpu.registers.t2 = 2;
-        memory.write_word(0x00400000, 0x012a4822); // sub $t1, $t1, $t2
+        cpu.registers.t1 = 0xDEADBEEF;
+        memory.write_word(0x00400000, 0x01205009); // jalr $t1, $t2
         cpu.step(&mut memory);
-        assert_eq!(cpu.registers.t1 as i32, -1);
-        assert_eq!(cpu.registers.t2, 2);
+        assert_eq!(cpu.registers.pc, 0xDEADBEEF);
     }
 
+    // opcode: 0b000000
+    // funct: 0b001010
+    #[test]
+    fn test_run_movz() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 0;
+        cpu.registers.t2 = 0xDEADBEEF;
+        cpu.registers.t3 = 0;
+        memory.write_word(0x00400000, 0x014b480a); // movz $t1, $t2, $t3
+        memory.write_word(0x00400004, 0x014b480a); // movz $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0xDEADBEEF);
+        assert_eq!(cpu.registers.t2, 0xDEADBEEF);
+        assert_eq!(cpu.registers.t3, 0);
+        cpu.registers.t1 = 0;
+        cpu.registers.t3 = 1;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0);
+        assert_eq!(cpu.registers.t2, 0xDEADBEEF);
+        assert_eq!(cpu.registers.t3, 1);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b001011
+    #[test]
+    fn test_run_movn() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 0;
+        cpu.registers.t2 = 0xDEADBEEF;
+        cpu.registers.t3 = 0;
+        memory.write_word(0x00400000, 0x014b480b); // movn $t1, $t2, $t3
+        memory.write_word(0x00400004, 0x014b480b); // movn $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0);
+        assert_eq!(cpu.registers.t2, 0xDEADBEEF);
+        assert_eq!(cpu.registers.t3, 0);
+        cpu.registers.t3 = 1;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0xDEADBEEF);
+        assert_eq!(cpu.registers.t2, 0xDEADBEEF);
+        assert_eq!(cpu.registers.t3, 1);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b001100
+    #[test]
+    fn test_run_syscall() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.v0 = 10;
+        memory.write_word(0x00400000, 0x0000000c); // syscall
+        cpu.step(&mut memory);
+        assert_eq!(cpu.halted, true);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b001101
+    #[test]
+    fn test_run_breakpoint() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x0000000d); // breakpoint
+        cpu.step(&mut memory);
+        assert_eq!(cpu.halted, true);
+        assert_eq!(cpu.exception, Exception::Breakpoint);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b010000
+    #[test]
+    fn test_run_mfhi() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.hi = 0xDEADBEEF;
+        memory.write_word(0x00400000, 0x00004810); // mfhi $t1
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0xDEADBEEF);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b010001
+    #[test]
+    fn test_run_mthi() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 0xDEADBEEF;
+        memory.write_word(0x00400000, 0x01200011); // mthi $t1
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.hi, 0xDEADBEEF);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b010010
+    #[test]
+    fn test_run_mflo() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.lo = 0xDEADBEEF;
+        memory.write_word(0x00400000, 0x00004812); // mflo $t1
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0xDEADBEEF);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b010011
+    #[test]
+    fn test_run_mtlo() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 0xDEADBEEF;
+        memory.write_word(0x00400000, 0x01200013); // mthi $t1
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.lo, 0xDEADBEEF);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b011000
+    #[test]
+    fn test_run_mult() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 0xaaaaaaaa;
+        cpu.registers.t2 = 0x33333333;
+        memory.write_word(0x00400000, 0x012a0018); // mult $t1, $t2
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.hi, 0x22222221);
+        assert_eq!(cpu.registers.lo, 0xDDDDDDDE);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b011001
     #[test]
     fn test_run_multu() {
         let mut cpu = CPU::default();
@@ -604,18 +1334,393 @@ mod tests {
         assert_eq!(cpu.registers.lo, 0xDDDDDDDE);
     }
 
+    // opcode: 0b000000
+    // funct: 0b011010
     #[test]
-    fn test_run_mflo() {
+    fn test_run_div() {
         let mut cpu = CPU::default();
         let mut memory = Memory::default();
         memory.text_address = 0x00400000;
-        cpu.registers.hi = 0x22222221;
-        cpu.registers.lo = 0xDDDDDDDE;
-        memory.write_word(0x00400000, 0x00005012); // mflo $t2
+        cpu.registers.t1 = 10;
+        cpu.registers.t2 = 3;
+        memory.write_word(0x00400000, 0x012a001a); // div $t1, $t2
         cpu.step(&mut memory);
-        assert_eq!(cpu.registers.t2, 0xDDDDDDDE);
+        assert_eq!(cpu.registers.hi, 1);
+        assert_eq!(cpu.registers.lo, 3);
     }
 
+    // opcode: 0b000000
+    // funct: 0b011011
+    #[test]
+    fn test_run_divu() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 10;
+        cpu.registers.t2 = 3;
+        memory.write_word(0x00400000, 0x012a001b); // div $t1, $t2
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.hi, 1);
+        assert_eq!(cpu.registers.lo, 3);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100000
+    #[test]
+    fn test_run_add() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        memory.write_word(0x00400000, 0x014b4820); // add $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 3);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100001
+    #[test]
+    fn test_run_addu() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        memory.write_word(0x00400000, 0x014b4821); // addu $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 3);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100010
+    #[test]
+    fn test_run_sub() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = u32::MAX - 1;
+        memory.write_word(0x00400000, 0x014b4822); // sub $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1 as i32, 1);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100011
+    #[test]
+    fn test_run_subu() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = u32::MAX - 1;
+        memory.write_word(0x00400000, 0x014b4823); // subu $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 1);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100100
+    #[test]
+    fn test_run_and() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = 0b10101010;
+        cpu.registers.t3 = 0b11100011;
+        memory.write_word(0x00400000, 0x014b4824); // and $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b10100010);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100101
+    #[test]
+    fn test_run_or() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = 0b10101010;
+        cpu.registers.t3 = 0b11100011;
+        memory.write_word(0x00400000, 0x014b4825); // or $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b11101011);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100110
+    #[test]
+    fn test_run_xor() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = 0b10101010;
+        cpu.registers.t3 = 0b11100011;
+        memory.write_word(0x00400000, 0x014b4826); // xor $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0b01001001);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b100111
+    #[test]
+    fn test_run_nor() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = 0x0000FAFB;
+        cpu.registers.t3 = 0x0000F000;
+        memory.write_word(0x00400000, 0x014b4827); // nor $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0xFFFF0504);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b101010
+    #[test]
+    fn test_run_slt() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = u32::MAX - 1;
+        cpu.registers.t3 = u32::MAX;
+        memory.write_word(0x00400000, 0x014b482a); // slt $t1, $t2, $t3
+        memory.write_word(0x00400004, 0x014b482a); // slt $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 1);
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = u32::MAX - 1;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b101011
+    #[test]
+    fn test_run_sltu() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t2 = u32::MAX - 1;
+        cpu.registers.t3 = u32::MAX;
+        memory.write_word(0x00400000, 0x014b482b); // sltu $t1, $t2, $t3
+        memory.write_word(0x00400004, 0x014b482b); // sltu $t1, $t2, $t3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 1);
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = u32::MAX - 1;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b110000
+    #[test]
+    fn test_run_tge() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x014b4830); // tge $t2, $t3
+        memory.write_word(0x00400004, 0x014b4830); // tge $t2, $t3
+        memory.write_word(0x00400008, 0x014b4830); // tge $t2, $t3
+        memory.write_word(0x0040000c, 0x014b4830); // tge $t2, $t3
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+        cpu.registers.t2 = 2;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b110001
+    #[test]
+    fn test_run_tgeu() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x014b4831); // tgeu $t2, $t3
+        memory.write_word(0x00400004, 0x014b4831); // tgeu $t2, $t3
+        memory.write_word(0x00400008, 0x014b4831); // tgeu $t2, $t3
+        memory.write_word(0x0040000c, 0x014b4831); // tgeu $t2, $t3
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+        cpu.registers.t2 = 2;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b110010
+    #[test]
+    fn test_run_tlt() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x014b4832); // tge $t2, $t3
+        memory.write_word(0x00400004, 0x014b4832); // tge $t2, $t3
+        memory.write_word(0x00400008, 0x014b4832); // tge $t2, $t3
+        memory.write_word(0x0040000c, 0x014b4832); // tge $t2, $t3
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+        cpu.registers.t2 = 2;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b110011
+    #[test]
+    fn test_run_tltu() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x014b4833); // tgeu $t2, $t3
+        memory.write_word(0x00400004, 0x014b4833); // tgeu $t2, $t3
+        memory.write_word(0x00400008, 0x014b4833); // tgeu $t2, $t3
+        memory.write_word(0x0040000c, 0x014b4833); // tgeu $t2, $t3
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+        cpu.registers.t2 = u32::MAX;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+        cpu.registers.t2 = 2;
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b110100
+    #[test]
+    fn test_run_teq() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x014b4834); // teq $t2, $t3
+        memory.write_word(0x00400004, 0x014b4834); // teq $t2, $t3
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+    }
+
+    // opcode: 0b000000
+    // funct: 0b110110
+    #[test]
+    fn test_run_tne() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x014b4836); // tne $t2, $t3
+        memory.write_word(0x00400004, 0x014b4836); // tne $t2, $t3
+        cpu.registers.t2 = 1;
+        cpu.registers.t3 = 2;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::Trap);
+        cpu.registers.t3 = 1;
+        cpu.exception = Exception::None;
+        cpu.step(&mut memory);
+        assert_eq!(cpu.exception, Exception::None);
+    }
+
+    // opcode: 0b000010
+    #[test]
+    fn test_run_j() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        memory.write_word(0x00400000, 0x08100000); // j 0x00400000
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.pc, 0x00400000);
+    }
+
+    // opcode: 0b000100
+    #[test]
+    fn test_run_beq() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 1;
+        cpu.registers.t2 = 2;
+        cpu.registers.t3 = 3;
+        memory.write_word(0x00400000, 0x012a4820); // add $t1, $t1, $t2
+        memory.write_word(0x00400004, 0x112bfffe); // beq $t1, $t3, -2
+        cpu.step(&mut memory);
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 3);
+        assert_eq!(cpu.registers.t2, 2);
+        assert_eq!(cpu.registers.t3, 3);
+        assert_eq!(cpu.registers.pc, 0x00400000);
+        cpu.step(&mut memory);
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 5);
+        assert_eq!(cpu.registers.t2, 2);
+        assert_eq!(cpu.registers.t3, 3);
+        assert_eq!(cpu.registers.pc, 0x00400008);
+    }
+
+    // opcode: 0b000101
     #[test]
     fn test_run_bne() {
         let mut cpu = CPU::default();
@@ -630,16 +1735,43 @@ mod tests {
         assert_eq!(cpu.registers.pc, 0x00400000);
     }
 
+    // opcode: 0b001000
     #[test]
-    fn test_run_j() {
+    fn test_run_addi() {
         let mut cpu = CPU::default();
         let mut memory = Memory::default();
         memory.text_address = 0x00400000;
-        memory.write_word(0x00400000, 0x08100000);
+        cpu.registers.t1 = 1;
+        memory.write_word(0x00400000, 0x21290003); // addi $t1, $t1, 0x4821
         cpu.step(&mut memory);
-        assert_eq!(cpu.registers.pc, 0x00400000);
+        assert_eq!(cpu.registers.t1, 4);
     }
 
+    // opcode: 0b001001
+    #[test]
+    fn test_run_addiu() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 1;
+        memory.write_word(0x00400000, 0x25290003); // addiu $t1, $t1, 3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 4);
+    }
+
+    // opcode: 0b001100
+    #[test]
+    fn test_run_andi() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 0xDEADBEEF;
+        memory.write_word(0x00400000, 0x3129BABE); // andi $t1, $t1, 3
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 0x0000BAAE);
+    }
+
+    // opcode: 0b001111
     #[test]
     fn test_run_lui() {
         let mut cpu = CPU::default();
@@ -650,6 +1782,32 @@ mod tests {
         assert_eq!(cpu.registers.t1, 0x00010000);
     }
 
+    // opcode: 0b010100
+    #[test]
+    fn test_run_beql() {
+        let mut cpu = CPU::default();
+        let mut memory = Memory::default();
+        memory.text_address = 0x00400000;
+        cpu.registers.t1 = 1;
+        cpu.registers.t2 = 2;
+        cpu.registers.t3 = 3;
+        memory.write_word(0x00400000, 0x012a4820); // add $t1, $t1, $t2
+        memory.write_word(0x00400004, 0x512BFFFE); // beql $t1, $t2, -2
+        cpu.step(&mut memory);
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 3);
+        assert_eq!(cpu.registers.t2, 2);
+        assert_eq!(cpu.registers.t3, 3);
+        assert_eq!(cpu.registers.pc, 0x00400000);
+        cpu.step(&mut memory);
+        cpu.step(&mut memory);
+        assert_eq!(cpu.registers.t1, 5);
+        assert_eq!(cpu.registers.t2, 2);
+        assert_eq!(cpu.registers.t3, 3);
+        assert_eq!(cpu.registers.pc, 0x00400008);
+    }
+
+    // opcode: 0b100011
     #[test]
     fn test_run_lw() {
         let mut cpu = CPU::default();
@@ -661,8 +1819,10 @@ mod tests {
         memory.write_word(0x10000004, 0x12345678);
         cpu.step(&mut memory);
         assert_eq!(cpu.registers.t2, 0x12345678);
+        assert_eq!(memory.data.len(), 8);
     }
 
+    // opcode: 0b101011
     #[test]
     fn test_run_sw() {
         let mut cpu = CPU::default();
@@ -674,5 +1834,6 @@ mod tests {
         memory.write_word(0x00400000, 0xad2a0004); // sw $t2, 4($t1)
         cpu.step(&mut memory);
         assert_eq!(memory.read_word(0x10000004), 0x12345678);
+        assert_eq!(memory.data.len(), 8);
     }
 }

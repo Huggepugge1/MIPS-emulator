@@ -10,6 +10,7 @@ fn main() -> eframe::Result {
     let binary = args().nth(1).expect("No binary provided");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_maximized(true),
+        vsync: false,
         ..Default::default()
     };
 
@@ -32,14 +33,22 @@ struct MyApp {
     memory: memory::Memory,
 
     binary: Vec<u8>,
+
+    running: bool,
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, _ctx: &egui::Context, _cc: &mut eframe::Frame) {
+        _ctx.request_repaint_after(std::time::Duration::from_millis(0));
+        if self.running {
+            for _ in 0..100 {
+                self.cpu.step(&mut self.memory);
+            }
+        }
         egui::CentralPanel::default().show(_ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Run").clicked() {
-                    self.cpu.run(&mut self.memory);
+                    self.running = true;
                 }
 
                 if ui.button("step").clicked() {
@@ -53,8 +62,8 @@ impl eframe::App for MyApp {
                 self.draw_memory(ui);
                 ui.vertical(|ui| {
                     ui.heading("Status");
-                    if self.cpu.status.is_some() {
-                        ui.label(self.cpu.status.as_ref().unwrap());
+                    if self.cpu.exception != cpu::Exception::None {
+                        ui.label(format!("{}", self.cpu.exception));
                     } else if self.cpu.halted {
                         ui.label("Halted");
                     } else {
